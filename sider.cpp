@@ -3,6 +3,7 @@
 //#include "stdafx.h"
 #include <windows.h>
 #include <shellapi.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <time.h>
@@ -23,6 +24,7 @@
 #include "libz.h"
 #include "kitinfo.h"
 #include "audio.h"
+#include "regs.h"
 
 #define XINPUT_USE_9_1_0
 #define DIRECTINPUT_VERSION 0x0800
@@ -297,6 +299,7 @@ DWORD _edit_team_id;
 extern "C" SCOREBOARD_INFO *_sci = NULL;
 int _stats_table_index = 0;
 int _match_lib_index = 0;
+bool _has_on_frame(false);
 
 // home team encoded-id offset: 0x104
 // home team name offset:       0x108
@@ -758,6 +761,10 @@ extern "C" void sider_set_edit_team_id_hk();
 
 extern "C" void sider_set_edit_team_id(DWORD team_id_encoded);
 
+extern "C" void sider_custom_event_rbx_hk();
+
+extern "C" void sider_custom_event(uint16_t param, REGISTERS *regs);
+
 static DWORD dwThreadId;
 static DWORD hookingThreadId = 0;
 static HMODULE myHDLL;
@@ -774,7 +781,6 @@ bool _is_game(false);
 bool _is_sider(false);
 bool _is_edit_mode(false);
 bool _priority_set(false);
-HANDLE _mh = NULL;
 
 wstring _overlay_header;
 wchar_t _overlay_text[4096];
@@ -1619,6 +1625,9 @@ struct module_t {
     int evt_gamepad_input;
     int evt_show;
     int evt_hide;
+    int evt_context_reset;
+    int evt_custom;
+    int evt_display_frame;
 };
 vector<module_t*> _modules;
 module_t* _curr_m;
@@ -1803,78 +1812,46 @@ static bool is_sider(wchar_t* name)
     return false;
 }
 
-static bool write_mapping_info(config_t *config)
+static bool is_already_loaded(HMODULE hDLL)
 {
-    // determine the size needed
-    DWORD size = sizeof(wchar_t);
-    vector<wstring>::iterator it;
-    for (it = _config->_exe_names.begin();
-            it != _config->_exe_names.end();
-            it++) {
-        size += sizeof(wchar_t) * (it->size() + 1);
-    }
+    HMODULE hModules[1024];
+    DWORD cb_needed;
+    wchar_t me[MAX_PATH];
+    wchar_t t[MAX_PATH];
 
-    _mh = CreateFileMapping(
-        INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_COMMIT,
-        0, size, SIDER_FM);
-    if (!_mh) {
-        log_(L"W: CreateFileMapping FAILED: %d\n", GetLastError());
-        return false;
-    }
-    wchar_t *mem = (wchar_t*)MapViewOfFile(_mh, FILE_MAP_WRITE, 0, 0, 0);
-    if (!mem) {
-        log_(L"W: MapViewOfFile FAILED: %d\n", GetLastError());
-        CloseHandle(_mh);
-        return false;
-    }
+    GetModuleFileName(hDLL, me, MAX_PATH);
 
-    memset(mem, 0, size);
-    for (it = config->_exe_names.begin();
-            it != _config->_exe_names.end();
-            it++) {
-        wcscpy(mem, it->c_str());
-        mem += it->size() + 1;
+    if (EnumProcessModules(GetCurrentProcess(), hModules, sizeof(hModules), &cb_needed)) {
+        log_(L"EnumProcessModules: found %d loaded DLLs\n", cb_needed/sizeof(HMODULE));
+        for (int i=0; i<cb_needed/sizeof(HMODULE); i++) {
+            GetModuleFileName(hModules[i], t, MAX_PATH);
+            wchar_t *filename = wcsrchr(t, L'\\');
+            if (filename && wcsicmp(filename, L"\\sider.dll")==0 && wcsicmp(t, me)!=0) {
+                log_(L"another sider.dll already loaded from: %s\n", t);
+                return true;
+            }
+        }
     }
-    return true;
+    else {
+        log_(L"EnumProcessModules failed with: 0x%x\n", GetLastError());
+    }
+    return false;
 }
 
 static bool is_pes(wchar_t* name, wstring** match)
 {
-    HANDLE h = OpenFileMapping(FILE_MAP_READ, FALSE, SIDER_FM);
-    if (!h) {
-        int err = GetLastError();
-        wchar_t *t = new wchar_t[MAX_PATH];
-        GetModuleFileName(NULL, t, MAX_PATH);
-        log_(L"R: OpenFileMapping FAILED (for %s): %d\n", t, err);
-        delete t;
-        return false;
-    }
-    BYTE *patterns = (BYTE*)MapViewOfFile(h, FILE_MAP_READ, 0, 0, 0);
-    if (!patterns) {
-        int err= GetLastError();
-        wchar_t *t = new wchar_t[MAX_PATH];
-        GetModuleFileName(NULL, t, MAX_PATH);
-        log_(L"R: MapViewOfFile FAILED (for %s): %d\n", t, err);
-        delete t;
-        CloseHandle(h);
-        return false;
-    }
-
     bool result = false;
     wchar_t *filename = wcsrchr(name, L'\\');
     if (filename) {
-        wchar_t *s = (wchar_t*)patterns;
-        while (*s != L'\0') {
-            if (wcsicmp(filename, s) == 0) {
-                *match = new wstring(s);
+        vector<wstring>::iterator it = _config->_exe_names.begin();
+        for (; it != _config->_exe_names.end(); it++) {
+            if (wcsicmp(filename, it->c_str()) == 0) {
+                *match = new wstring(*it);
                 result = true;
                 break;
             }
-            s = s + wcslen(s) + 1;
         }
     }
-    UnmapViewOfFile(h);
-    CloseHandle(h);
     return result;
 }
 
@@ -2357,6 +2334,58 @@ void module_after_set_conditions(module_t *m)
     }
 }
 
+void module_context_reset(module_t *m)
+{
+    if (m->evt_context_reset != 0) {
+        EnterCriticalSection(&_cs);
+        lua_pushvalue(m->L, m->evt_context_reset);
+        lua_xmove(m->L, L, 1);
+        // push params
+        lua_pushvalue(L, 1); // ctx
+        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+            const char *err = luaL_checkstring(L, -1);
+            logu_("[%d] lua ERROR from module_context_reset: %s\n", GetCurrentThreadId(), err);
+            lua_pop(L, 1);
+        }
+        LeaveCriticalSection(&_cs);
+    }
+}
+
+bool module_custom_event(module_t *m, uint16_t param, REGISTERS *regs)
+{
+    bool processed = false;
+    if (m->evt_custom != 0) {
+        EnterCriticalSection(&_cs);
+        log_(L"module_custom_event for: %s\n", m->filename->c_str());
+        lua_pushvalue(m->L, m->evt_custom);
+        lua_xmove(m->L, L, 1);
+        // push params
+        lua_pushvalue(L, 1); // ctx
+        lua_pushinteger(L, param);
+        lua_newtable(L); // registers
+        log_(L"regs: %p\n", regs);
+        registers_to_lua_table(L, -1, regs);
+        log_(L"module_custom_event: registers copied to table\n");
+
+        if (lua_pcall(L, 3, 2, 0) != LUA_OK) {
+            const char *err = luaL_checkstring(L, -1);
+            logu_("[%d] lua ERROR from module_custom_event: %s\n", GetCurrentThreadId(), err);
+            lua_pop(L, 1);
+            LeaveCriticalSection(&_cs);
+            return false;
+        }
+        log_(L"module_custom_event: lua_pcall returned\n");
+        processed = lua_toboolean(L, -2);
+        if (lua_istable(L, -1)) {
+            // registers
+            registers_from_lua_table(L, -1, regs);
+        }
+        lua_pop(L,2);
+        LeaveCriticalSection(&_cs);
+    }
+    return processed;
+}
+
 void module_set_teams(module_t *m, DWORD home, DWORD away) //, TEAM_INFO_STRUCT *home_team_info, TEAM_INFO_STRUCT *away_team_info)
 {
     if (m->evt_set_teams != 0) {
@@ -2569,6 +2598,23 @@ void module_hide(module_t *m)
     _block_input = false;
     _hard_block = false;
     LeaveCriticalSection(&_cs);
+}
+
+void module_on_frame(module_t *m)
+{
+    if (m->evt_display_frame != 0) {
+        EnterCriticalSection(&_cs);
+        lua_pushvalue(m->L, m->evt_display_frame);
+        lua_xmove(m->L, L, 1);
+        // push params
+        lua_pushvalue(L, 1); // ctx
+        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+            const char *err = luaL_checkstring(L, -1);
+            logu_("[%d] lua ERROR from module_display_frame: %s\n", GetCurrentThreadId(), err);
+            lua_pop(L, 1);
+        }
+        LeaveCriticalSection(&_cs);
+    }
 }
 
 void module_overlay_on(module_t *m, char **text, char **image_path, struct layout_t *opts)
@@ -3896,6 +3942,16 @@ DWORD direct_input_poll(void *param) {
     return 0;
 }
 
+bool siderVirtualProtect(void *addr, size_t size, DWORD newProt, DWORD *oldProt) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        logu_("Memory info: state=0x%x, protect=0x%x, type=0x%x\n", mbi.State, mbi.Protect, mbi.Type);
+        return VirtualProtect(addr, size, newProt, oldProt);
+    }
+    logu_("VirtualQuery failed for %p (error_code: 0x%x)\n", addr, GetLastError());
+    return false;
+}
+
 void HookVtblMethod(void *self, int idx, map<BYTE**,BYTE*>* vtables, void *new_func, char *name)
 {
     lock_t lock(&_cs);
@@ -3918,7 +3974,7 @@ void HookVtblMethod(void *self, int idx, map<BYTE**,BYTE*>* vtables, void *new_f
 
         DWORD protection = 0;
         DWORD newProtection = PAGE_EXECUTE_READWRITE;
-        if (VirtualProtect(vtbl+idx, 8, newProtection, &protection)) {
+        if (siderVirtualProtect(vtbl+idx, 8, newProtection, &protection) || (_config->_skip_checks & 0x04)) {
             vtbl[idx] = (BYTE*)new_func;
             f = vtbl[idx];
             logu_("now %s = %p\n", name, f);
@@ -3956,7 +4012,7 @@ void HookVtblMethod2(void *self, int idx, void **old_func, void **old_func2, voi
 
         DWORD protection = 0;
         DWORD newProtection = PAGE_EXECUTE_READWRITE;
-        if (VirtualProtect(vtbl+idx, 8, newProtection, &protection)) {
+        if (siderVirtualProtect(vtbl+idx, 8, newProtection, &protection) || (_config->_skip_checks & 0x08)) {
             vtbl[idx] = (BYTE*)new_func;
             f = vtbl[idx];
             logu_("now %s = %p\n", name, f);
@@ -4098,7 +4154,7 @@ void HookXInputGetState()
 
             DWORD protection;
             DWORD newProtection = PAGE_EXECUTE_READWRITE;
-            if (VirtualProtect(_xinput_get_state_holder, 8, newProtection, &protection)) {
+            if (siderVirtualProtect(_xinput_get_state_holder, 8, newProtection, &protection) || (_config->_skip_checks & 0x10)) {
                 *_xinput_get_state_holder = (BYTE*)sider_XInputGetState;
                 log_(L"now XInputGetState: %p\n", *_xinput_get_state_holder);
             }
@@ -4170,6 +4226,17 @@ HRESULT sider_Present(IDXGISwapChain *swapChain, UINT SyncInterval, UINT Flags)
                 }
             }
             _controller_prepped = true;
+        }
+    }
+
+    if (_has_on_frame) {
+        if (_config->_lua_enabled) {
+            // lua call-backs
+            vector<module_t*>::iterator i;
+            for (i = _modules.begin(); i != _modules.end(); i++) {
+                module_t *m = *i;
+                module_on_frame(m);
+            }
         }
     }
 
@@ -4372,7 +4439,7 @@ HRESULT sider_CreateSwapChain(IDXGIFactory1 *pFactory, IUnknown *pDevice, DXGI_S
 
         DWORD protection = 0;
         DWORD newProtection = PAGE_EXECUTE_READWRITE;
-        if (VirtualProtect(vtbl+8, 8, newProtection, &protection)) {
+        if (siderVirtualProtect(vtbl+8, 8, newProtection, &protection) || (_config->_skip_checks & 0x02)) {
             vtbl[8] = (BYTE*)sider_Present;
 
             present = (PFN_IDXGISwapChain_Present)vtbl[8];
@@ -4406,7 +4473,7 @@ HRESULT sider_CreateDXGIFactory1(REFIID riid, void **ppFactory)
 
         DWORD protection = 0;
         DWORD newProtection = PAGE_EXECUTE_READWRITE;
-        if (VirtualProtect(vtbl+10, 8, newProtection, &protection)) {
+        if (siderVirtualProtect(vtbl+10, 8, newProtection, &protection) || (_config->_skip_checks & 0x01)) {
             vtbl[10] = (BYTE*)sider_CreateSwapChain;
 
             sc = (PFN_IDXGIFactory1_CreateSwapChain)vtbl[10];
@@ -4868,6 +4935,27 @@ void sider_context_reset()
     _away_team_info = NULL;
 
     logu_("context reset\n");
+
+    if (_config->_lua_enabled) {
+        // lua callbacks
+        vector<module_t*>::iterator i;
+        for (i = _modules.begin(); i != _modules.end(); i++) {
+            module_context_reset(*i);
+        }
+    }
+}
+
+void sider_custom_event(uint16_t param, REGISTERS *regs) {
+    if (_config->_lua_enabled) {
+        // lua callbacks
+        vector<module_t*>::iterator i;
+        for (i = _modules.begin(); i != _modules.end(); i++) {
+            bool processed = module_custom_event(*i, param, regs);
+            if (processed) {
+                break;
+            }
+        }
+    }
 }
 
 void sider_free_select(BYTE *controller_restriction)
@@ -5889,6 +5977,25 @@ static int sider_context_register(lua_State *L)
         _curr_m->evt_after_set_conditions = lua_gettop(_curr_m->L);
         logu_("Registered for \"%s\" event\n", event_key);
     }
+    else if (strcmp(event_key, "context_reset")==0) {
+        lua_pushvalue(L, -1);
+        lua_xmove(L, _curr_m->L, 1);
+        _curr_m->evt_context_reset = lua_gettop(_curr_m->L);
+        logu_("Registered for \"%s\" event\n", event_key);
+    }
+    else if (strcmp(event_key, "custom_event")==0) {
+        lua_pushvalue(L, -1);
+        lua_xmove(L, _curr_m->L, 1);
+        _curr_m->evt_custom = lua_gettop(_curr_m->L);
+        logu_("Registered for \"%s\" event\n", event_key);
+    }
+    else if (strcmp(event_key, "display_frame")==0) {
+        lua_pushvalue(L, -1);
+        lua_xmove(L, _curr_m->L, 1);
+        _curr_m->evt_display_frame = lua_gettop(_curr_m->L);
+        _has_on_frame = true;
+        logu_("Registered for \"%s\" event\n", event_key);
+    }
     /*
     else if (strcmp(event_key, "set_stadium_for_replay")==0) {
         lua_pushvalue(L, -1);
@@ -6003,6 +6110,9 @@ static void push_context_table(lua_State *L)
 
     lua_pushcfunction(L, sider_context_register);
     lua_setfield(L, -2, "register");
+
+    lua_pushlightuserdata(L, (void*)sider_custom_event_rbx_hk);
+    lua_setfield(L, -2, "custom_evt_rbx");
 
     // ctx.kits
     lua_newtable(L);
@@ -6567,6 +6677,7 @@ bool all_found(config_t *cfg);
 DWORD install_func(LPVOID thread_param) {
     log_(L"DLL attaching to (%s).\n", module_filename);
     log_(L"Mapped into PES.\n");
+    log_(L"sider dir: %s\n", sider_dir);
     logu_("UTF-8 check: ленинградское время ноль часов ноль минут.\n");
 
     _is_game = true;
@@ -6599,6 +6710,7 @@ DWORD install_func(LPVOID thread_param) {
     //if (_config->_game_speed) {
     //    log_(L"game.speed = %0.3f\n", *(_config->_game_speed));
     //}
+    log_(L"skip.checks = %d\n", _config->_skip_checks);
     log_(L"game.priority.class = 0x%x\n", _config->_priority_class);
     log_(L"livecpk.enabled = %d\n", _config->_livecpk_enabled);
     log_(L"lookup-cache.enabled = %d\n", _config->_lookup_cache_enabled);
@@ -7118,6 +7230,7 @@ bool hook_if_all_found() {
             log_(L"sider_check_kit_choice: %p\n", sider_check_kit_choice_hk);
             log_(L"sider_data_ready: %p\n", sider_data_ready_hk);
             log_(L"call_to_move at: %p\n", _config->_hp_at_call_to_move);
+            log_(L"sider_custom_event_rbx_hk: %p\n", sider_custom_event_rbx_hk);
 
             if (_config->_hp_at_set_team_id) {
                 BYTE *check_addr = _config->_hp_at_set_team_id - offs_set_team_id + offs_check_set_team_id;
@@ -7346,25 +7459,26 @@ INT APIENTRY DllMain(HMODULE hDLL, DWORD Reason, LPVOID Reserved)
                 return FALSE;
             }
 
+            read_configuration(_config);
+
             if (is_sider(module_filename)) {
                 _is_sider = true;
-                read_configuration(_config);
-                if (!write_mapping_info(_config)) {
-                    return FALSE;
-                }
-
                 return TRUE;
             }
 
             if (is_pes(module_filename, &match)) {
-                read_configuration(_config);
                 read_gamepad_global_mapping(_gamepad_config);
 
                 wstring version;
                 get_module_version(hDLL, version);
-                open_log_(L"============================\n");
+                start_log_(L"============================\n");
                 log_(L"Sider DLL: version %s\n", version.c_str());
                 log_(L"Filename match: %s\n", match->c_str());
+                if (is_already_loaded(hDLL)) {
+                    log_(L"DLL already loaded into the game. Nothing to do\n");
+                    close_log_();
+                    return FALSE;
+                }
 
                 // set up a thread-scope hook, to replace global hook
                 // so that we stay mapped in game process
@@ -7441,11 +7555,6 @@ INT APIENTRY DllMain(HMODULE hDLL, DWORD Reason, LPVOID Reserved)
 
         case DLL_PROCESS_DETACH:
             //log_(L"DLL_PROCESS_DETACH: %s\n", module_filename);
-
-            if (_is_sider) {
-                UnmapViewOfFile(_mh);
-                CloseHandle(_mh);
-            }
 
             if (_is_game) {
                 log_(L"DLL detaching from (%s).\n", module_filename);

@@ -6,7 +6,6 @@ local C = ffi.C
 
 ffi.cdef [[
 bool VirtualProtect(void *p, size_t len, uint32_t newprot, uint32_t *oldprot);
-bool VirtualProtect(void *p, size_t len, uint32_t newprot, uint32_t *oldprot);
 int memcmp(void *dst, void *src, size_t len);
 int wsprintfA(char *dst, char *fmt, ...);
 
@@ -21,6 +20,8 @@ typedef DWORD* DWORD_PTR;
 typedef uint64_t DWORDLONG;
 typedef size_t SIZE_T;
 typedef bool BOOL;
+
+BYTE* VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize, DWORD  flAllocationType, DWORD  flProtect);
 
 typedef struct _IMAGE_DOS_HEADER
 {
@@ -120,6 +121,7 @@ typedef struct _MEMORY_BASIC_INFORMATION {
   DWORD  Type;
 } MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
 
+DWORD GetLastError();
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX lpBuffer);
 void GetSystemInfo(LPSYSTEM_INFO lpSystemInfo);
 SIZE_T VirtualQuery(
@@ -201,11 +203,28 @@ function m.write(addr, s)
     local p = ffi.cast('char*', addr)
     local oldprot = ffi.new('uint32_t[1]',{});
     local len = #s
-    if not C.VirtualProtect(p, len, PAGE_EXECUTE_READWRITE, oldprot) then
-        return error(string.format('VirtualProtect failed for %s - %s memory range',
-            m.hex(p), m.hex(p+len)))
+    local left = len
+    for i=1,#s,16 do
+        local sz = math.min(16, left)
+        if not C.VirtualProtect(p+i-1, sz, PAGE_EXECUTE_READWRITE, oldprot) then
+            local error_code = C.GetLastError()
+            return error(string.format('VirtualProtect failed for %s - %s memory range (error code: %s)',
+                m.hex(p+i-1), m.hex(p+i-1+sz-1), m.hex(error_code)))
+        end
+        left = left - sz
     end
     ffi.copy(p, s, len)
+end
+
+function m.allocate_codecave(len_bytes)
+    local allocationFlags = 0x1000 + 0x2000
+    local protection_execute_readwrite = 0x40
+    local addr = C.VirtualAlloc(nil, len_bytes, allocationFlags, protection_execute_readwrite)
+    if not addr then
+        local error_code = C.GetLastError()
+        return error(string.format('VirtualAlloc failed (error code: %s)', m.hex(error_code)))
+    end
+    return addr
 end
 
 local format_sizes = {
