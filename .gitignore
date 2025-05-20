@@ -36,3 +36,4 @@ luajit.exp
 luajit.lib
 minilua.exp
 minilua.lib
+build

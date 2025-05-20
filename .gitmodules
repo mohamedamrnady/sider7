@@ -1,0 +1,6 @@
+[submodule "soft/zlib"]
+	path = soft/zlib
+	url = https://github.com/madler/zlib
+[submodule "soft/luajit"]
+	path = soft/luajit
+	url = https://luajit.org/git/luajit.git
