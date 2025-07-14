@@ -18,8 +18,7 @@
 #include "utf8.h"
 #include "common.h"
 #include "patterns.h"
-#include "memlib.h"
-#include "fslib.h"
+#include "lualibs.h"
 #include "kmp.h"
 #include "libz.h"
 #include "kitinfo.h"
@@ -75,6 +74,7 @@ lua_State *L = NULL;
 int _memory_lib_index = 0;
 int _fs_lib_index = 0;
 int _audio_lib_index = 0;
+int _util_lib_index = 0;
 
 struct FILE_HANDLE_INFO {
     HANDLE handle;
@@ -6327,13 +6327,8 @@ static void push_env_table(lua_State *L, module_t *m)
     lua_setfield(L, -2, "set_blocked");
     lua_setfield(L, -2, "input");
 
-    // memory lib
-    lua_pushvalue(L, _memory_lib_index);
-    lua_setfield(L, -2, "memory");
-
-    // fs lib
-    lua_pushvalue(L, _fs_lib_index);
-    lua_setfield(L, -2, "fs");
+    // Assign all embedded lua libraries to sider table
+    assign_all_libs_to_sider_table(L);
 
     // audio lib
     lua_pushvalue(L, _audio_lib_index);
@@ -6440,13 +6435,8 @@ void init_lua_support()
         // prepare context table
         push_context_table(L);
 
-        // memory library
-        init_memlib(L);
-        _memory_lib_index = lua_gettop(L);
-
-        // memory library
-        init_fslib(L);
-        _fs_lib_index = lua_gettop(L);
+        // Initialize all embedded lua libraries
+        init_all_lua_libs(L);
 
         // audio library
         init_audio_lib(L);

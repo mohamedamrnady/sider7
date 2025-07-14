@@ -55,17 +55,22 @@ libz.obj: libz.cpp libz.h common.h
 kitinfo.obj: kitinfo.cpp kitinfo.h
 regs.obj: regs.cpp regs.h
 
-memlib.obj: memlib.h memlib_lua.h memlib.cpp
-memlib_lua.h: memory.lua makememlibhdr.exe
-	makememlibhdr.exe
-makememlibhdr.exe: makememlibhdr.c
-	$(CC) makememlibhdr.c
+# Generic lua library embedder
+lua_embedder.exe: lua_embedder.c
+	$(CC) lua_embedder.c
 
-fslib.obj: fslib.h fslib_lua.h fslib.cpp
-fslib_lua.h: fs.lua makefslibhdr.exe
-	makefslibhdr.exe
-makefslibhdr.exe: makefslibhdr.c
-	$(CC) makefslibhdr.c
+# Embedded lua libraries
+memlib_lua.h: memory.lua lua_embedder.exe
+	lua_embedder.exe memory.lua memlib_lua.h memlib_lua
+
+fslib_lua.h: fs.lua lua_embedder.exe
+	lua_embedder.exe fs.lua fslib_lua.h fslib_lua
+
+utillib_lua.h: util.lua lua_embedder.exe
+	lua_embedder.exe util.lua utillib_lua.h utillib_lua
+
+# Library objects
+lualibs.obj: lualibs.h lualibs.cpp fslib_lua.h memlib_lua.h utillib_lua.h
 
 $(LPZLIB)\$(ZLIBLIB):
     cd $(LPZLIB) && nmake -f win32\Makefile.msc
@@ -96,8 +101,8 @@ ptexshader.h: ptexshader.hlsl
 	fxc /E siderTexPS /Ges /T ps_4_0 /Fh ptexshader.h ptexshader.hlsl
 
 sider.obj: sider.cpp sider.h patterns.h common.h config.h audio.h imageutil.h vshader.h vtexshader.h pshader.h ptexshader.h libz.h kitinfo.h utf8.h regs.h
-sider.dll: sider.obj util.obj imageutil.obj version.obj common.obj kmp.obj memlib.obj fslib.obj libz.obj audio.obj kitinfo.obj DDSTextureLoader.obj WICTextureLoader.obj regs.obj sider.res $(LUALIBPATH)\$(LUALIB) $(FW1LIBPATH)\$(FW1LIB) $(LPZLIB)\$(ZLIBLIB)
-	$(LINK) $(LFLAGS) /out:sider.dll /DLL sider.obj util.obj imageutil.obj version.obj common.obj kmp.obj memlib.obj fslib.obj libz.obj audio.obj kitinfo.obj DDSTextureLoader.obj WICTextureLoader.obj regs.obj sider.res $(ZLIBLIB) /LIBPATH:$(LUALIBPATH) /LIBPATH:$(FW1LIBPATH) $(LIBS) $(LUALIB) $(FW1LIB) /LIBPATH:$(LPZLIB) /LIBPATH:"$(LIB)"
+sider.dll: sider.obj util.obj imageutil.obj version.obj common.obj kmp.obj lualibs.obj libz.obj audio.obj kitinfo.obj DDSTextureLoader.obj WICTextureLoader.obj regs.obj sider.res $(LUALIBPATH)\$(LUALIB) $(FW1LIBPATH)\$(FW1LIB) $(LPZLIB)\$(ZLIBLIB)
+	$(LINK) $(LFLAGS) /out:sider.dll /DLL sider.obj util.obj imageutil.obj version.obj common.obj kmp.obj lualibs.obj libz.obj audio.obj kitinfo.obj DDSTextureLoader.obj WICTextureLoader.obj regs.obj sider.res $(ZLIBLIB) /LIBPATH:$(LUALIBPATH) /LIBPATH:$(FW1LIBPATH) $(LIBS) $(LUALIB) $(FW1LIB) /LIBPATH:$(LPZLIB) /LIBPATH:"$(LIB)"
 
 sider.exe: main.obj sider.dll sider_main.res
 	$(LINK) $(LFLAGS) /out:sider.exe main.obj sider_main.res $(LIBS) sider.lib /LIBPATH:"$(LIB)"
@@ -115,7 +120,7 @@ $(LUAJIT): $(LUALIBPATH)\$(LUALIB)
 	$(CC) $(CFLAGS) -c $(INC) $(LUAINC) $(FW1INC) $(ZLIBINC) $(MAINC) $<
 
 clean:
-	del *.obj *.dll *.exp *.res *.lib *.exe *~ memlib_lua.h vshader.h vtexshader.h pshader.h ptexshader.h
+	del *.obj *.dll *.exp *.res *.lib *.exe *~ *lib_lua.h vshader.h vtexshader.h pshader.h ptexshader.h
 
 clean-all: clean
 	cd $(LUALIBPATH) && del /Q lua51.exp lua51.lib lua51.dll luajit.exe

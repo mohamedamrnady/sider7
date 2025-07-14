@@ -8,9 +8,7 @@ s*.dll
 lua51.dll
 lua51.exp
 lua51.lib
-memlib_lua.h
-fslib_lua.h
-fileutil_lua.h
+*lib_lua.h
 *.log*
 *~
 Debug/
